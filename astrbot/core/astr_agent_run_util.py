@@ -165,16 +165,18 @@ async def run_agent(
                     # 对于其他情况，暂时先不处理
                     continue
                 elif resp.type == "tool_call":
+                    tool_info = _extract_chain_json_data(resp.data["chain"])
+
                     if agent_runner.streaming and show_tool_use:
                         # 向下游平台发送 "break" 分段信号（空 MessageChain，不携带数据）。
                         # 平台适配器收到后会关闭当前流式消息，并在后续文本到来时创建新消息。
                         # 仅在 show_tool_use 为 True 时才发送：此时紧接着会通过
                         # astr_event.send() 独立发送工具状态消息（如"🔨 调用工具: xxx"），
                         # 需要分段才能保证消息顺序正确。
-                        # 若 show_tool_use 为 False，不会有独立消息插入，无需分段。
+                        # 不支持流式的平台（如 Discord）应通过 unsupported_streaming_strategy
+                        # 设为 "turn_off" 走非流式路径，每轮 LLM 响应自然分段。
                         yield MessageChain(chain=[], type="break")
 
-                    tool_info = _extract_chain_json_data(resp.data["chain"])
                     astr_event.trace.record(
                         "agent_tool_call",
                         tool_name=tool_info if tool_info else "unknown",

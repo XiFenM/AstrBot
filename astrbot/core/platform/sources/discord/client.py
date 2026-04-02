@@ -29,6 +29,7 @@ class DiscordBotClient(discord.Bot):
 
         # 回调函数
         self.on_message_received: Callable[[dict], Awaitable[None]] | None = None
+        self.on_component_interaction: Callable[[discord.Interaction], Awaitable[None]] | None = None
         self.on_ready_once_callback: Callable[[], Awaitable[None]] | None = None
         self._ready_once_fired = False
 
@@ -92,6 +93,19 @@ class DiscordBotClient(discord.Bot):
             "guild_id": str(interaction.guild_id) if interaction.guild_id else None,
             "type": "interaction",
         }
+
+    async def on_interaction(self, interaction: discord.Interaction) -> None:
+        """处理交互事件（按钮点击等）"""
+        # 先让 Pycord 处理斜杠指令等内置交互
+        # 仅拦截 component 类型（按钮/选择菜单）
+        if interaction.type == discord.InteractionType.component and self.on_component_interaction:
+            try:
+                await self.on_component_interaction(interaction)
+            except Exception as e:
+                logger.error(f"[Discord] 处理按钮交互失败: {e}", exc_info=True)
+            return
+        # 其他交互类型交给父类处理（斜杠指令等）
+        await super().on_interaction(interaction)
 
     async def on_message(self, message: discord.Message) -> None:
         """当接收到消息时触发"""

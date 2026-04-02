@@ -632,6 +632,14 @@ class TelegramPlatformAdapter(Platform):
         elif data.startswith("conv_ls:"):
             page = data[len("conv_ls:"):]
             cmd_str = f"/ls {page}"
+        elif data.startswith("hapi_approve:"):
+            arg = data[len("hapi_approve:"):]
+            cmd_str = "/hapi a" if arg == "all" else f"/hapi allow {arg}"
+        elif data.startswith("hapi_deny:"):
+            arg = data[len("hapi_deny:"):]
+            cmd_str = "/hapi deny" if arg == "all" else f"/hapi deny {arg}"
+        elif data.startswith("hapi_sw:"):
+            cmd_str = f"/hapi sw {data[len('hapi_sw:'):]}"
         else:
             return
 

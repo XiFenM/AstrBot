@@ -142,6 +142,7 @@ class DiscordPlatformAdapter(Platform):
         proxy = self.config.get("discord_proxy") or None
         self.client = DiscordBotClient(token, proxy)
         self.client.on_message_received = on_received
+        self.client.on_component_interaction = self._handle_component_interaction
 
         async def callback() -> None:
             if self.enable_command_register:
@@ -322,6 +323,70 @@ class DiscordPlatformAdapter(Platform):
 
         self.commit_event(message_event)
 
+    async def _handle_component_interaction(self, interaction: discord.Interaction) -> None:
+        """处理 Discord 按钮交互，将其转换为合成命令消息放入事件队列。"""
+        data = interaction.data
+        if not data:
+            return
+        custom_id = data.get("custom_id", "")
+        if not custom_id:
+            return
+
+        # 根据 custom_id 映射到对应命令（与 Telegram callback_query_handler 逻辑一致）
+        if custom_id.startswith("hapi_approve:"):
+            arg = custom_id[len("hapi_approve:"):]
+            cmd_str = "hapi a" if arg == "all" else f"hapi allow {arg}"
+        elif custom_id.startswith("hapi_deny:"):
+            arg = custom_id[len("hapi_deny:"):]
+            cmd_str = "hapi deny" if arg == "all" else f"hapi deny {arg}"
+        elif custom_id.startswith("hapi_sw:"):
+            cmd_str = f"hapi sw {custom_id[len('hapi_sw:'):]}"
+        elif custom_id.startswith("conv_switch:"):
+            cmd_str = f"switch_cid {custom_id[len('conv_switch:'):]}"
+        elif custom_id.startswith("conv_ls:"):
+            cmd_str = f"ls {custom_id[len('conv_ls:'):]}"
+        else:
+            return
+
+        # 先响应交互，避免 Discord 显示"交互失败"
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        user = interaction.user
+        if not user:
+            return
+
+        channel = interaction.channel
+        channel_id = str(interaction.channel_id) if interaction.channel_id else ""
+
+        abm = AstrBotMessage()
+        abm.session_id = channel_id
+        if isinstance(channel, DMChannel):
+            abm.type = MessageType.FRIEND_MESSAGE
+        else:
+            abm.type = MessageType.GROUP_MESSAGE
+            abm.group_id = channel_id
+        abm.sender = MessageMember(str(user.id), user.display_name or "Unknown")
+        abm.self_id = str(self.client_self_id) if self.client_self_id else ""
+        abm.raw_message = interaction
+        abm.message_str = cmd_str
+        abm.message = [Plain(cmd_str)]
+        abm.message_id = str(interaction.id)
+
+        # 直接创建事件并提交，不走 handle_msg（避免 raw_message 类型检查）
+        message_event = DiscordPlatformEvent(
+            message_str=abm.message_str,
+            message_obj=abm,
+            platform_meta=self.meta(),
+            session_id=abm.session_id,
+            client=self.client,
+        )
+        message_event.is_wake = True
+        message_event.is_at_or_wake_command = True
+        self.commit_event(message_event)
+
     @override
     async def terminate(self) -> None:
         """终止适配器"""
@@ -412,8 +477,13 @@ class DiscordPlatformAdapter(Platform):
 
         # 使用 Pycord 的方法同步指令
         # 注意：这可能需要一些时间，并且有频率限制
-        await self.client.sync_commands()
-        logger.info("[Discord] 指令同步完成。")
+        try:
+            await asyncio.wait_for(self.client.sync_commands(), timeout=30)
+            logger.info("[Discord] 指令同步完成。")
+        except asyncio.TimeoutError:
+            logger.warning("[Discord] 指令同步超时（30s），可能是 Discord API 速率限制。已有指令仍可使用。")
+        except Exception as e:
+            logger.warning(f"[Discord] 指令同步失败: {e}")
 
     def _create_dynamic_callback(self, cmd_name: str):
         """为每个指令动态创建一个异步回调函数"""

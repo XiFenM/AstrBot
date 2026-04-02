@@ -40,6 +40,18 @@ class TelegramInlineKeyboard:
     type: str = "TelegramInlineKeyboard"
 
 
+class TelegramHTMLText:
+    """Telegram HTML 格式文本组件（仅用于 Telegram 适配器）。
+
+    将此对象加入 MessageChain，Telegram 适配器会直接以 HTML parse_mode 发送，
+    跳过 telegramify_markdown 转换。适用于 expandable blockquote 等原生 HTML 特性。
+    """
+
+    def __init__(self, html: str):
+        self.html = html
+        self.type = "TelegramHTMLText"
+
+
 def _is_gif(path: str) -> bool:
     if path.lower().endswith(".gif"):
         return True
@@ -48,6 +60,70 @@ def _is_gif(path: str) -> bool:
             return f.read(6) in (b"GIF87a", b"GIF89a")
     except OSError:
         return False
+
+class _StreamingCtx:
+    """流式输出期间的共享可变状态。
+
+    ``_send_streaming_draft`` / ``_send_streaming_edit`` 运行期间创建并挂到
+    ``TelegramPlatformEvent._streaming_ctx`` 上；``send()`` 检测到该对象存在且
+    ``delta`` 非空时，会先 flush 已累积的文本为真实消息，再发送新消息。
+    这样即使 ``show_tool_use=False``，工具审批等通过 ``event.send()`` 插入的独立
+    消息也不会与流式缓冲冲突。
+    """
+
+    __slots__ = (
+        "mode", "delta", "last_sent_text", "draft_id",
+        "payload", "user_name", "message_thread_id",
+        "text_changed", "message_id", "event_ref",
+    )
+
+    def __init__(
+        self,
+        mode: str,
+        payload: dict[str, Any],
+        user_name: str,
+        message_thread_id: str | None,
+        event_ref: "TelegramPlatformEvent",
+    ) -> None:
+        self.mode = mode  # "draft" | "edit"
+        self.delta = ""
+        self.last_sent_text = ""
+        self.draft_id: int = 0  # draft 模式专用
+        self.payload = payload
+        self.user_name = user_name
+        self.message_thread_id = message_thread_id
+        self.message_id: int | None = None  # edit 模式专用
+        self.text_changed: asyncio.Event = asyncio.Event()
+        self.event_ref = event_ref
+
+    async def flush(self) -> None:
+        """将已累积的 delta 刷为真实消息，重置缓冲区。"""
+        if not self.delta:
+            return
+        text = self.delta
+
+        if self.mode == "draft":
+            # 清空 draft 显示
+            await self.event_ref._send_message_draft(
+                self.user_name, self.draft_id, "\u23f3", self.message_thread_id,
+            )
+            await self.event_ref._send_final_segment(text, self.payload)
+            self.draft_id = TelegramPlatformEvent._allocate_draft_id()
+        else:
+            # edit 模式：如果有 message_id，最终编辑一次
+            if self.message_id:
+                try:
+                    await self.event_ref.client.edit_message_text(
+                        text=text,
+                        chat_id=self.payload["chat_id"],
+                        message_id=self.message_id,
+                    )
+                except Exception as e:
+                    logger.warning(f"flush edit_message_text failed: {e!s}")
+            self.message_id = None
+
+        self.delta = ""
+        self.last_sent_text = ""
 
 
 class TelegramPlatformEvent(AstrMessageEvent):
@@ -94,6 +170,11 @@ class TelegramPlatformEvent(AstrMessageEvent):
     ) -> None:
         super().__init__(message_str, message_obj, platform_meta, session_id)
         self.client = client
+
+        # ── 流式输出状态（供 send() 在流式期间自动 flush） ──
+        # _send_streaming_draft / _send_streaming_edit 运行期间设置，
+        # send() 检测到有累积内容时会先 flush 再发送新消息。
+        self._streaming_ctx: _StreamingCtx | None = None
 
     @classmethod
     def _split_message(cls, text: str) -> list[str]:
@@ -281,17 +362,17 @@ class TelegramPlatformEvent(AstrMessageEvent):
             # it's a supergroup chat with message_thread_id
             user_name, message_thread_id = user_name.split("#")
 
-        # 收集内联键盘（如有），并记录最后一个 Plain 的索引，键盘将附加在那里
+        # 收集内联键盘（如有），并记录最后一个文本组件的索引，键盘将附加在那里
         _reply_markup: InlineKeyboardMarkup | None = None
-        _last_plain_idx: int | None = None
+        _last_text_idx: int | None = None
         for _idx, _item in enumerate(message.chain):
             if isinstance(_item, TelegramInlineKeyboard):
                 _reply_markup = InlineKeyboardMarkup([
                     [InlineKeyboardButton(text=label, callback_data=data) for label, data in row]
                     for row in _item.buttons
                 ])
-            if isinstance(_item, Plain):
-                _last_plain_idx = _idx
+            if isinstance(_item, (Plain, TelegramHTMLText)):
+                _last_text_idx = _idx
 
         # 根据消息链确定合适的 chat action 并发送
         action = cls._get_chat_action_for_chain(message.chain)
@@ -312,9 +393,9 @@ class TelegramPlatformEvent(AstrMessageEvent):
                     at_flag = True
                 chunks = cls._split_message(i.text)
                 for chunk_idx, chunk in enumerate(chunks):
-                    # 仅在最后一个 Plain 的最后一个分块上附加键盘
+                    # 仅在最后一个文本组件的最后一个分块上附加键盘
                     is_last_chunk = (
-                        chain_idx == _last_plain_idx and chunk_idx == len(chunks) - 1
+                        chain_idx == _last_text_idx and chunk_idx == len(chunks) - 1
                     )
                     markup = _reply_markup if is_last_chunk else None
                     try:
@@ -336,6 +417,14 @@ class TelegramPlatformEvent(AstrMessageEvent):
                             reply_markup=markup,
                             **cast(Any, payload),
                         )
+            elif isinstance(i, TelegramHTMLText):
+                markup = _reply_markup if chain_idx == _last_text_idx else None
+                await client.send_message(
+                    text=i.html,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                    **cast(Any, payload),
+                )
             elif isinstance(i, Image):
                 image_path = await i.convert_to_file_path()
                 if _is_gif(image_path):
@@ -369,6 +458,10 @@ class TelegramPlatformEvent(AstrMessageEvent):
                 )
 
     async def send(self, message: MessageChain) -> None:
+        # 流式输出期间有独立消息插入 → 先 flush 已累积的流式文本
+        if self._streaming_ctx and self._streaming_ctx.delta:
+            await self._streaming_ctx.flush()
+
         if self.get_message_type() == MessageType.GROUP_MESSAGE:
             await self.send_with_client(self.client, message, self.message_obj.group_id)
         else:
@@ -527,9 +620,10 @@ class TelegramPlatformEvent(AstrMessageEvent):
             await self.client.send_message(text=delta, **cast(Any, payload))
 
     async def send_streaming(self, generator, use_fallback: bool = False):
+        msg_type = self.get_message_type()
         message_thread_id = None
 
-        if self.get_message_type() == MessageType.GROUP_MESSAGE:
+        if msg_type == MessageType.GROUP_MESSAGE:
             user_name = self.message_obj.group_id
         else:
             user_name = self.get_sender_id()
@@ -576,45 +670,48 @@ class TelegramPlatformEvent(AstrMessageEvent):
         流式结束后发送一条真实消息保留最终内容（draft 是临时的，会消失）。
         使用信号驱动的发送循环：每次有新 token 到达时唤醒发送，
         发送频率由网络 RTT 自然限制（最多一个请求 in-flight）。
+
+        通过 ``self._streaming_ctx`` 与 ``send()`` 共享缓冲区状态：
+        若工具执行中通过 ``event.send()`` 插入独立消息（如审批通知），
+        ``send()`` 会自动先 flush 已累积的文本为真实消息，保证消息顺序。
         """
-        draft_id = self._allocate_draft_id()
-        delta = ""
-        last_sent_text = ""
+        ctx = _StreamingCtx("draft", payload, user_name, message_thread_id, self)
+        ctx.draft_id = self._allocate_draft_id()
+        self._streaming_ctx = ctx
+
         done = False  # 信号：生成器已结束
-        text_changed = asyncio.Event()  # 有新 token 到达时触发
 
         async def _draft_sender_loop() -> None:
             """信号驱动的草稿发送循环，有新内容就发，RTT 自然限流。"""
-            nonlocal last_sent_text
             while not done:
-                await text_changed.wait()
-                text_changed.clear()
+                await ctx.text_changed.wait()
+                ctx.text_changed.clear()
                 # 发送最新的缓冲区内容（MarkdownV2 渲染，与真实消息一致）
-                if delta and delta != last_sent_text:
-                    draft_text = delta[: self.MAX_MESSAGE_LENGTH]
-                    if draft_text != last_sent_text:
+                if ctx.delta and ctx.delta != ctx.last_sent_text:
+                    draft_text = ctx.delta[: self.MAX_MESSAGE_LENGTH]
+                    if draft_text != ctx.last_sent_text:
                         try:
                             md = telegramify_markdown.markdownify(
                                 draft_text,
                             )
                             await self._send_message_draft(
                                 user_name,
-                                draft_id,
+                                ctx.draft_id,
                                 md,
                                 message_thread_id,
                                 parse_mode="MarkdownV2",
                             )
-                            last_sent_text = draft_text
+                            ctx.last_sent_text = draft_text
                         except Exception:
                             # markdownify 对未闭合语法可能失败，回退纯文本
                             try:
                                 await self._send_message_draft(
                                     user_name,
-                                    draft_id,
+                                    ctx.draft_id,
                                     draft_text,
                                     message_thread_id,
                                 )
-                                last_sent_text = draft_text
+                                ctx.last_sent_text = draft_text
                             except Exception as e2:
                                 logger.debug(
                                     f"[Telegram] sendMessageDraft failed (ignored): {e2!s}"
@@ -623,9 +720,8 @@ class TelegramPlatformEvent(AstrMessageEvent):
         sender_task = asyncio.create_task(_draft_sender_loop())
 
         def _append_text(t: str) -> None:
-            nonlocal delta
-            delta += t
-            text_changed.set()  # 唤醒发送循环
+            ctx.delta += t
+            ctx.text_changed.set()  # 唤醒发送循环
 
         try:
             async for chain in generator:
@@ -634,18 +730,7 @@ class TelegramPlatformEvent(AstrMessageEvent):
 
                 if chain.type == "break":
                     # 分割符：发送真实消息保留内容，重置缓冲区
-                    if delta:
-                        # 用 emoji 清空 draft 显示，避免 draft 和真实消息同时可见
-                        await self._send_message_draft(
-                            user_name,
-                            draft_id,
-                            "\u23f3",
-                            message_thread_id,
-                        )
-                        await self._send_final_segment(delta, payload)
-                    delta = ""
-                    last_sent_text = ""
-                    draft_id = self._allocate_draft_id()
+                    await ctx.flush()
                     continue
 
                 await self._process_chain_items(
@@ -653,18 +738,19 @@ class TelegramPlatformEvent(AstrMessageEvent):
                 )
         finally:
             done = True
-            text_changed.set()  # 唤醒循环使其退出
+            ctx.text_changed.set()  # 唤醒循环使其退出
             await sender_task
+            self._streaming_ctx = None
 
-        # 流式结束：用 emoji 清空 draft，然后发真实消息持久化
-        if delta:
+        # 流式结束：flush 剩余内容
+        if ctx.delta:
             await self._send_message_draft(
                 user_name,
-                draft_id,
+                ctx.draft_id,
                 "\u23f3",
                 message_thread_id,
             )
-            await self._send_final_segment(delta, payload)
+            await self._send_final_segment(ctx.delta, payload)
 
     async def _send_streaming_edit(
         self,
@@ -673,10 +759,15 @@ class TelegramPlatformEvent(AstrMessageEvent):
         payload: dict[str, Any],
         generator,
     ) -> None:
-        """使用 send_message + edit_message_text 进行流式推送（群聊 fallback）。"""
-        delta = ""
+        """使用 send_message + edit_message_text 进行流式推送（群聊 fallback）。
+
+        通过 ``self._streaming_ctx`` 与 ``send()`` 共享缓冲区状态，
+        实现流式期间独立消息插入时的自动 flush。
+        """
+        ctx = _StreamingCtx("edit", payload, user_name, message_thread_id, self)
+        self._streaming_ctx = ctx
+
         current_content = ""
-        message_id = None
         last_edit_time = 0  # 上次编辑消息的时间
         throttle_interval = 0.6  # 编辑消息的间隔时间 (秒)
         last_chat_action_time = 0  # 上次发送 chat action 的时间
@@ -687,85 +778,79 @@ class TelegramPlatformEvent(AstrMessageEvent):
         last_chat_action_time = asyncio.get_running_loop().time()
 
         def _append_text(t: str) -> None:
-            nonlocal delta
-            delta += t
+            ctx.delta += t
 
-        async for chain in generator:
-            if not isinstance(chain, MessageChain):
-                continue
+        try:
+            async for chain in generator:
+                if not isinstance(chain, MessageChain):
+                    continue
 
-            if chain.type == "break":
-                # 分割符
-                if message_id:
-                    try:
-                        await self.client.edit_message_text(
-                            text=delta,
-                            chat_id=payload["chat_id"],
-                            message_id=message_id,
-                        )
-                    except Exception as e:
-                        logger.warning(f"编辑消息失败(streaming-break): {e!s}")
-                message_id = None
-                delta = ""
-                continue
+                if chain.type == "break":
+                    # 分割符
+                    await ctx.flush()
+                    current_content = ""
+                    continue
 
-            await self._process_chain_items(
-                chain, payload, user_name, message_thread_id, _append_text
-            )
+                await self._process_chain_items(
+                    chain, payload, user_name, message_thread_id, _append_text
+                )
 
-            # 编辑或发送消息
-            if message_id and len(delta) <= self.MAX_MESSAGE_LENGTH:
-                current_time = asyncio.get_running_loop().time()
-                time_since_last_edit = current_time - last_edit_time
+                # flush 可能被 send() 触发过，此时 message_id 已重置
+                # 编辑或发送消息
+                if ctx.message_id and len(ctx.delta) <= self.MAX_MESSAGE_LENGTH:
+                    current_time = asyncio.get_running_loop().time()
+                    time_since_last_edit = current_time - last_edit_time
 
-                if time_since_last_edit >= throttle_interval:
+                    if time_since_last_edit >= throttle_interval:
+                        current_time = asyncio.get_running_loop().time()
+                        if current_time - last_chat_action_time >= chat_action_interval:
+                            await self._ensure_typing(user_name, message_thread_id)
+                            last_chat_action_time = current_time
+                        try:
+                            await self.client.edit_message_text(
+                                text=ctx.delta,
+                                chat_id=payload["chat_id"],
+                                message_id=ctx.message_id,
+                            )
+                            current_content = ctx.delta
+                        except Exception as e:
+                            logger.warning(f"编辑消息失败(streaming): {e!s}")
+                        last_edit_time = asyncio.get_running_loop().time()
+                else:
                     current_time = asyncio.get_running_loop().time()
                     if current_time - last_chat_action_time >= chat_action_interval:
                         await self._ensure_typing(user_name, message_thread_id)
                         last_chat_action_time = current_time
                     try:
-                        await self.client.edit_message_text(
-                            text=delta,
-                            chat_id=payload["chat_id"],
-                            message_id=message_id,
+                        msg = await self.client.send_message(
+                            text=ctx.delta, **cast(Any, payload)
                         )
-                        current_content = delta
+                        current_content = ctx.delta
                     except Exception as e:
-                        logger.warning(f"编辑消息失败(streaming): {e!s}")
+                        logger.warning(f"发送消息失败(streaming): {e!s}")
+                    ctx.message_id = msg.message_id
                     last_edit_time = asyncio.get_running_loop().time()
-            else:
-                current_time = asyncio.get_running_loop().time()
-                if current_time - last_chat_action_time >= chat_action_interval:
-                    await self._ensure_typing(user_name, message_thread_id)
-                    last_chat_action_time = current_time
-                try:
-                    msg = await self.client.send_message(
-                        text=delta, **cast(Any, payload)
-                    )
-                    current_content = delta
-                except Exception as e:
-                    logger.warning(f"发送消息失败(streaming): {e!s}")
-                message_id = msg.message_id
-                last_edit_time = asyncio.get_running_loop().time()
+        finally:
+            self._streaming_ctx = None
 
         try:
-            if delta and current_content != delta:
+            if ctx.delta and current_content != ctx.delta:
                 try:
                     markdown_text = telegramify_markdown.markdownify(
-                        delta,
+                        ctx.delta,
                     )
                     await self.client.edit_message_text(
                         text=markdown_text,
                         chat_id=payload["chat_id"],
-                        message_id=message_id,
+                        message_id=ctx.message_id,
                         parse_mode="MarkdownV2",
                     )
                 except Exception as e:
                     logger.warning(f"Markdown转换失败，使用普通文本: {e!s}")
                     await self.client.edit_message_text(
-                        text=delta,
+                        text=ctx.delta,
                         chat_id=payload["chat_id"],
-                        message_id=message_id,
+                        message_id=ctx.message_id,
                     )
         except Exception as e:
             logger.warning(f"编辑消息失败(streaming): {e!s}")

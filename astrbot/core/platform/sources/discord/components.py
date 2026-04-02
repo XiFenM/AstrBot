@@ -8,26 +8,14 @@ class DiscordEmbed(BaseMessageComponent):
     """Discord Embed消息组件"""
 
     type: str = "discord_embed"
-
-    def __init__(
-        self,
-        title: str | None = None,
-        description: str | None = None,
-        color: int | None = None,
-        url: str | None = None,
-        thumbnail: str | None = None,
-        image: str | None = None,
-        footer: str | None = None,
-        fields: list[dict] | None = None,
-    ) -> None:
-        self.title = title
-        self.description = description
-        self.color = color
-        self.url = url
-        self.thumbnail = thumbnail
-        self.image = image
-        self.footer = footer
-        self.fields = fields or []
+    title: str | None = None
+    description: str | None = None
+    color: int | None = None
+    url: str | None = None
+    thumbnail: str | None = None
+    image: str | None = None
+    footer: str | None = None
+    fields: list[dict] = []
 
     def to_discord_embed(self) -> discord.Embed:
         """转换为Discord Embed对象"""
@@ -62,46 +50,28 @@ class DiscordButton(BaseMessageComponent):
     """Discord按钮组件"""
 
     type: str = "discord_button"
-
-    def __init__(
-        self,
-        label: str,
-        custom_id: str | None = None,
-        style: str = "primary",
-        emoji: str | None = None,
-        url: str | None = None,
-        disabled: bool = False,
-    ) -> None:
-        self.label = label
-        self.custom_id = custom_id
-        self.style = style
-        self.emoji = emoji
-        self.url = url
-        self.disabled = disabled
+    label: str = ""
+    custom_id: str | None = None
+    style: str = "primary"
+    emoji: str | None = None
+    url: str | None = None
+    disabled: bool = False
 
 
 class DiscordReference(BaseMessageComponent):
     """Discord引用组件"""
 
     type: str = "discord_reference"
-
-    def __init__(self, message_id: str, channel_id: str) -> None:
-        self.message_id = message_id
-        self.channel_id = channel_id
+    message_id: str = ""
+    channel_id: str = ""
 
 
 class DiscordView(BaseMessageComponent):
     """Discord视图组件，包含按钮和选择菜单"""
 
     type: str = "discord_view"
-
-    def __init__(
-        self,
-        components: list[BaseMessageComponent] | None = None,
-        timeout: float | None = None,
-    ) -> None:
-        self.components = components or []
-        self.timeout = timeout
+    components: list = []
+    timeout: float | None = None
 
     def to_discord_view(self) -> discord.ui.View:
         """转换为Discord View对象"""

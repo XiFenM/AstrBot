@@ -184,6 +184,10 @@ class WakingCheckStage(Stage):
                         passed = False
                         break
                 except Exception as e:
+                    logger.warning(
+                        f"filter 异常: handler={handler.handler_name}, "
+                        f"filter={type(filter).__name__}, error={e}"
+                    )
                     await event.send(
                         MessageEventResult().message(
                             f"插件 {star_map[handler.handler_module_path].name}: {e}",
