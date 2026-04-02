@@ -11,7 +11,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import BotCommand, Update
 from telegram.constants import ChatType
 from telegram.error import Forbidden, InvalidToken, NetworkError
-from telegram.ext import ApplicationBuilder, ContextTypes, ExtBot, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    ContextTypes,
+    ExtBot,
+    filters,
+)
 from telegram.ext import MessageHandler as TelegramMessageHandler
 
 import astrbot.api.message_components as Comp
@@ -142,6 +148,7 @@ class TelegramPlatformAdapter(Platform):
             callback=self.message_handler,
         )
         self.application.add_handler(message_handler)
+        self.application.add_handler(CallbackQueryHandler(self.callback_query_handler))
         self.client = self.application.bot
         logger.debug(f"Telegram base url: {self.client.base_url}")
 
@@ -735,6 +742,71 @@ class TelegramPlatformAdapter(Platform):
             logger.error(
                 f"Failed to process media group {media_group_id}", exc_info=True
             )
+            return
+
+        # Add additional media from remaining updates by reusing convert_message
+        for update, context in updates_and_contexts[1:]:
+            # Convert the message but skip reply chains (get_reply=False)
+            extra = await self.convert_message(update, context, get_reply=False)
+            if not extra:
+                continue
+
+            # Merge only the message components (keep base session/meta from first)
+            abm.message.extend(extra.message)
+            logger.debug(
+                f"Added {len(extra.message)} components to media group {media_group_id}"
+            )
+
+        # Process the merged message
+        await self.handle_msg(abm)
+
+    async def callback_query_handler(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """处理 Telegram 内联键盘按钮回调（HAPI 插件按钮），转为合成命令消息进入事件队列。"""
+        query = update.callback_query
+        if not query or not query.data or not query.message:
+            return
+
+        await query.answer()
+
+        data = query.data
+        if data.startswith("hapi_approve:"):
+            arg = data[len("hapi_approve:"):]
+            cmd_str = "/hapi a" if arg == "all" else f"/hapi allow {arg}"
+        elif data.startswith("hapi_deny:"):
+            arg = data[len("hapi_deny:"):]
+            cmd_str = "/hapi deny" if arg == "all" else f"/hapi deny {arg}"
+        elif data.startswith("hapi_sw:"):
+            cmd_str = f"/hapi sw {data[len('hapi_sw:'):]}"
+        else:
+            return
+
+        chat = query.message.chat
+        from_user = query.from_user
+        if not from_user:
+            return
+
+        abm = AstrBotMessage()
+        abm.session_id = str(chat.id)
+        if chat.type == ChatType.PRIVATE:
+            abm.type = MessageType.FRIEND_MESSAGE
+        else:
+            abm.type = MessageType.GROUP_MESSAGE
+            abm.group_id = str(chat.id)
+            if (
+                getattr(query.message, "is_topic_message", False)
+                and getattr(query.message, "message_thread_id", None)
+            ):
+                abm.group_id += "#" + str(query.message.message_thread_id)
+                abm.session_id = abm.group_id
+
+        abm.sender = MessageMember(str(from_user.id), from_user.username or "Unknown")
+        abm.self_id = str(context.bot.username)
+        abm.raw_message = update
+        abm.message_str = cmd_str
+        abm.message = [Comp.Plain(cmd_str)]
+        await self.handle_msg(abm)
 
     async def handle_msg(self, message: AstrBotMessage) -> None:
         message_event = TelegramPlatformEvent(
