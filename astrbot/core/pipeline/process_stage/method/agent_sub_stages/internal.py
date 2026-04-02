@@ -491,7 +491,8 @@ class InternalAgentSubStage(Stage):
                     "no more than 10 words, capturing only the core topic. "
                     "If the input is a greeting, small talk, or has no clear topic "
                     "(e.g. 'hi', 'hello', 'haha'), return <None>. "
-                    "Output only the title itself or <None>, with no explanations."
+                    "Output only the title itself or <None>, with no explanations. "
+                    "Do NOT use thinking or reasoning. Reply directly."
                 ),
                 prompt=(
                     "Generate a concise title for the following user query. "
