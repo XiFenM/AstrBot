@@ -2,10 +2,11 @@ import asyncio
 import os
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, cast
 
 import telegramify_markdown
-from telegram import ReactionTypeCustomEmoji, ReactionTypeEmoji
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeCustomEmoji, ReactionTypeEmoji
 from telegram.constants import ChatAction
 from telegram.error import BadRequest
 from telegram.ext import ExtBot
@@ -23,6 +24,20 @@ from astrbot.api.message_components import (
 )
 from astrbot.api.platform import AstrBotMessage, MessageType, PlatformMetadata
 from astrbot.core.utils.metrics import Metric
+
+
+@dataclass
+class TelegramInlineKeyboard:
+    """Telegram 内联键盘组件（仅用于 Telegram 适配器）。
+
+    将此对象加入 MessageChain，Telegram 适配器会在发送文本消息时附带内联按钮。
+
+    Attributes:
+        buttons: 按钮行列表，每行是 (显示文本, callback_data) 元组的列表。
+    """
+
+    buttons: list[list[tuple[str, str]]]
+    type: str = "TelegramInlineKeyboard"
 
 
 def _is_gif(path: str) -> bool:
@@ -266,11 +281,23 @@ class TelegramPlatformEvent(AstrMessageEvent):
             # it's a supergroup chat with message_thread_id
             user_name, message_thread_id = user_name.split("#")
 
+        # 收集内联键盘（如有），并记录最后一个 Plain 的索引，键盘将附加在那里
+        _reply_markup: InlineKeyboardMarkup | None = None
+        _last_plain_idx: int | None = None
+        for _idx, _item in enumerate(message.chain):
+            if isinstance(_item, TelegramInlineKeyboard):
+                _reply_markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(text=label, callback_data=data) for label, data in row]
+                    for row in _item.buttons
+                ])
+            if isinstance(_item, Plain):
+                _last_plain_idx = _idx
+
         # 根据消息链确定合适的 chat action 并发送
         action = cls._get_chat_action_for_chain(message.chain)
         await cls._send_chat_action(client, user_name, action, message_thread_id)
 
-        for i in message.chain:
+        for chain_idx, i in enumerate(message.chain):
             payload = {
                 "chat_id": user_name,
             }
@@ -284,7 +311,12 @@ class TelegramPlatformEvent(AstrMessageEvent):
                     i.text = f"@{at_user_id} {i.text}"
                     at_flag = True
                 chunks = cls._split_message(i.text)
-                for chunk in chunks:
+                for chunk_idx, chunk in enumerate(chunks):
+                    # 仅在最后一个 Plain 的最后一个分块上附加键盘
+                    is_last_chunk = (
+                        chain_idx == _last_plain_idx and chunk_idx == len(chunks) - 1
+                    )
+                    markup = _reply_markup if is_last_chunk else None
                     try:
                         md_text = telegramify_markdown.markdownify(
                             chunk,
@@ -292,13 +324,18 @@ class TelegramPlatformEvent(AstrMessageEvent):
                         await client.send_message(
                             text=md_text,
                             parse_mode="MarkdownV2",
+                            reply_markup=markup,
                             **cast(Any, payload),
                         )
                     except Exception as e:
                         logger.warning(
                             f"MarkdownV2 send failed: {e}. Using plain text instead.",
                         )
-                        await client.send_message(text=chunk, **cast(Any, payload))
+                        await client.send_message(
+                            text=chunk,
+                            reply_markup=markup,
+                            **cast(Any, payload),
+                        )
             elif isinstance(i, Image):
                 image_path = await i.convert_to_file_path()
                 if _is_gif(image_path):

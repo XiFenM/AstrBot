@@ -175,6 +175,13 @@ class Main(star.Star):
         """通过 /ls 前面的序号切换对话"""
         await self.conversation_c.switch_conv(message, index)
 
+    @filter.command("switch_cid")
+    async def switch_conv_by_id(
+        self, message: AstrMessageEvent, conv_id: str = ""
+    ) -> None:
+        """通过对话 ID 切换（供 Telegram 内联键盘使用）"""
+        await self.conversation_c.switch_conv_by_id(message, conv_id)
+
     @filter.command("rename")
     async def rename_conv(self, message: AstrMessageEvent, new_name: str) -> None:
         """重命名对话"""

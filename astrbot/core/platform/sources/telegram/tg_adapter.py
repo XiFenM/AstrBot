@@ -9,7 +9,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import BotCommand, Update
 from telegram.constants import ChatType
 from telegram.error import Forbidden, InvalidToken
-from telegram.ext import ApplicationBuilder, ContextTypes, ExtBot, filters
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ContextTypes, ExtBot, filters
 from telegram.ext import MessageHandler as TelegramMessageHandler
 
 import astrbot.api.message_components as Comp
@@ -90,6 +90,9 @@ class TelegramPlatformAdapter(Platform):
             callback=self.message_handler,
         )
         self.application.add_handler(message_handler)
+        self.application.add_handler(
+            CallbackQueryHandler(callback=self.callback_query_handler)
+        )
         self.client = self.application.bot
         logger.debug(f"Telegram base url: {self.client.base_url}")
 
@@ -610,6 +613,52 @@ class TelegramPlatformAdapter(Platform):
             )
 
         # Process the merged message
+        await self.handle_msg(abm)
+
+    async def callback_query_handler(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """处理 Telegram 内联键盘按钮回调，将其转换为合成命令消息放入事件队列。"""
+        query = update.callback_query
+        if not query or not query.data or not query.message:
+            return
+
+        await query.answer()
+
+        data = query.data
+        if data.startswith("conv_switch:"):
+            conv_id = data[len("conv_switch:"):]
+            cmd_str = f"/switch_cid {conv_id}"
+        elif data.startswith("conv_ls:"):
+            page = data[len("conv_ls:"):]
+            cmd_str = f"/ls {page}"
+        else:
+            return
+
+        chat = query.message.chat
+        from_user = query.from_user
+        if not from_user:
+            return
+
+        abm = AstrBotMessage()
+        abm.session_id = str(chat.id)
+        if chat.type == ChatType.PRIVATE:
+            abm.type = MessageType.FRIEND_MESSAGE
+        else:
+            abm.type = MessageType.GROUP_MESSAGE
+            abm.group_id = str(chat.id)
+            if (
+                getattr(query.message, "is_topic_message", False)
+                and getattr(query.message, "message_thread_id", None)
+            ):
+                abm.group_id += "#" + str(query.message.message_thread_id)
+                abm.session_id = abm.group_id
+
+        abm.sender = MessageMember(str(from_user.id), from_user.username or "Unknown")
+        abm.self_id = str(context.bot.username)
+        abm.raw_message = update
+        abm.message_str = cmd_str
+        abm.message = [Comp.Plain(cmd_str)]
         await self.handle_msg(abm)
 
     async def handle_msg(self, message: AstrBotMessage) -> None:

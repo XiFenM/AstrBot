@@ -263,7 +263,34 @@ class ConversationCommands:
         ret += f"\n第 {page} 页 | 共 {total_pages} 页"
         ret += "\n*输入 /ls 2 跳转到第 2 页"
 
-        message.set_result(MessageEventResult().message(ret).use_t2i(False))
+        result = MessageEventResult().message(ret).use_t2i(False)
+
+        if message.get_platform_name() == "telegram":
+            from astrbot.core.platform.sources.telegram.tg_event import TelegramInlineKeyboard
+
+            buttons: list[list[tuple[str, str]]] = []
+            # 每个对话一个切换按钮，每行最多 2 个
+            conv_buttons: list[tuple[str, str]] = []
+            g_idx = start_idx + 1
+            for conv in conversations_paged:
+                title = _titles.get(conv.cid, "新对话")
+                short_title = (title[:10] + "…") if len(title) > 10 else title
+                conv_buttons.append((f"{g_idx}. {short_title}", f"conv_switch:{conv.cid}"))
+                g_idx += 1
+            for i in range(0, len(conv_buttons), 2):
+                buttons.append(conv_buttons[i : i + 2])
+            # 翻页按钮
+            nav_row: list[tuple[str, str]] = []
+            if page > 1:
+                nav_row.append(("◀ 上一页", f"conv_ls:{page - 1}"))
+            if page < total_pages:
+                nav_row.append(("下一页 ▶", f"conv_ls:{page + 1}"))
+            if nav_row:
+                buttons.append(nav_row)
+            if buttons:
+                result.chain.append(TelegramInlineKeyboard(buttons=buttons))
+
+        message.set_result(result)
         return
 
     async def new_conv(self, message: AstrMessageEvent) -> None:
@@ -359,6 +386,29 @@ class ConversationCommands:
                     f"切换到对话: {title}({conversation.cid[:4]})。",
                 ),
             )
+
+    async def switch_conv_by_id(
+        self, message: AstrMessageEvent, conv_id: str = ""
+    ) -> None:
+        """通过完整对话 ID 切换对话（供 Telegram 内联键盘使用）"""
+        if not conv_id:
+            message.set_result(MessageEventResult().message("对话 ID 不能为空。"))
+            return
+        conv = await self.context.conversation_manager.get_conversation(
+            message.unified_msg_origin, conv_id
+        )
+        if not conv:
+            message.set_result(
+                MessageEventResult().message(f"未找到对话 {conv_id[:4]}，请使用 /ls 刷新列表。")
+            )
+            return
+        await self.context.conversation_manager.switch_conversation(
+            message.unified_msg_origin, conv_id
+        )
+        title = conv.title if conv.title else "新对话"
+        message.set_result(
+            MessageEventResult().message(f"切换到对话: {title}({conv_id[:4]})。")
+        )
 
     async def rename_conv(self, message: AstrMessageEvent, new_name: str = "") -> None:
         """重命名对话"""
