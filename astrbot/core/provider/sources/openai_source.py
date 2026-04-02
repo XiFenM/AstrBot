@@ -392,6 +392,13 @@ class ProviderOpenAIOfficial(Provider):
             self.client.chat.completions.create,
         ).parameters.keys()
 
+        # Responses API 支持
+        self.use_responses_api = bool(provider_config.get("use_responses_api", False))
+        if self.use_responses_api:
+            self.responses_default_params = inspect.signature(
+                self.client.responses.create,
+            ).parameters.keys()
+
         model = provider_config.get("model", "unknown")
         self.set_model(model)
 
@@ -421,14 +428,21 @@ class ProviderOpenAIOfficial(Provider):
         try:
             models_str = []
             models = await self.client.models.list()
-            models = sorted(models.data, key=lambda x: x.id)
-            for model in models:
-                models_str.append(model.id)
-            return models_str
+            for model in models.data:
+                if isinstance(model, str):
+                    models_str.append(model)
+                elif hasattr(model, "id"):
+                    models_str.append(model.id)
+            return sorted(models_str)
         except NotFoundError as e:
             raise Exception(f"获取模型列表失败：{e}")
+        except AttributeError as e:
+            raise Exception(f"获取模型列表失败（API 响应格式不兼容）：{e}")
 
     async def _query(self, payloads: dict, tools: ToolSet | None) -> LLMResponse:
+        if self.use_responses_api:
+            return await self._query_responses(payloads, tools)
+
         if tools:
             model = payloads.get("model", "").lower()
             omit_empty_param_field = "gemini" in model
@@ -501,6 +515,11 @@ class ProviderOpenAIOfficial(Provider):
         tools: ToolSet | None,
     ) -> AsyncGenerator[LLMResponse, None]:
         """流式查询API，逐步返回结果"""
+        if self.use_responses_api:
+            async for resp in self._query_responses_stream(payloads, tools):
+                yield resp
+            return
+
         if tools:
             model = payloads.get("model", "").lower()
             omit_empty_param_field = "gemini" in model
@@ -623,6 +642,208 @@ class ProviderOpenAIOfficial(Provider):
             input_cached=cached,
             output=completion_tokens,
         )
+
+    # ──── Responses API 支持 ────
+
+    @staticmethod
+    def _convert_messages_to_response_input(
+        messages: list[dict],
+    ) -> tuple[list[dict], str | None]:
+        """将 chat/completions messages 转换为 responses API 的 input + instructions。"""
+        instructions: str | None = None
+        input_items: list[dict] = []
+
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role in ("system", "developer"):
+                if isinstance(content, str):
+                    instructions = content
+                elif isinstance(content, list):
+                    instructions = " ".join(
+                        p.get("text", "") for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                continue
+
+            if role in ("user", "assistant"):
+                item: dict = {"type": "message", "role": role, "content": content}
+                input_items.append(item)
+                # assistant 消息中的 tool_calls → function_call items
+                if role == "assistant" and msg.get("tool_calls"):
+                    for tc in msg["tool_calls"]:
+                        func = tc.get("function", {})
+                        input_items.append({
+                            "type": "function_call",
+                            "call_id": tc.get("id", ""),
+                            "name": func.get("name", ""),
+                            "arguments": func.get("arguments", "{}"),
+                        })
+
+            elif role == "tool":
+                input_items.append({
+                    "type": "function_call_output",
+                    "call_id": msg.get("tool_call_id", ""),
+                    "output": content if isinstance(content, str) else str(content),
+                })
+
+        return input_items, instructions
+
+    @staticmethod
+    def _convert_tools_to_response_format(openai_tools: list[dict]) -> list[dict]:
+        """将 chat/completions 工具定义转为 responses API 格式（扁平结构）。"""
+        result = []
+        for tool in openai_tools:
+            if tool.get("type") != "function":
+                continue
+            func = tool.get("function", {})
+            resp_tool: dict = {
+                "type": "function",
+                "name": func.get("name", ""),
+                "parameters": func.get("parameters", {}),
+            }
+            desc = func.get("description")
+            if desc:
+                resp_tool["description"] = desc
+            result.append(resp_tool)
+        return result
+
+    def _build_responses_payload(
+        self, payloads: dict, tools: ToolSet | None,
+    ) -> tuple[dict, dict]:
+        """从 chat/completions payloads 构建 responses API 的请求参数。
+
+        Returns:
+            (resp_payloads, extra_body)
+        """
+        messages = payloads.pop("messages", [])
+        input_items, instructions = self._convert_messages_to_response_input(messages)
+
+        resp_payloads: dict = {
+            "model": payloads.get("model", self.get_model()),
+            "input": input_items,
+        }
+        if instructions:
+            resp_payloads["instructions"] = instructions
+
+        if tools:
+            openai_tools = tools.get_func_desc_openai_style(
+                omit_empty_parameter_field="gemini" in resp_payloads.get("model", "").lower()
+            )
+            if openai_tools:
+                resp_payloads["tools"] = self._convert_tools_to_response_format(openai_tools)
+                resp_payloads["tool_choice"] = payloads.get("tool_choice", "auto")
+
+        # 通用参数透传
+        for key in ("temperature", "top_p", "max_output_tokens"):
+            if key in payloads:
+                resp_payloads[key] = payloads[key]
+        if "max_tokens" in payloads and "max_output_tokens" not in resp_payloads:
+            resp_payloads["max_output_tokens"] = payloads["max_tokens"]
+
+        extra_body: dict = {}
+        custom_extra_body = self.provider_config.get("custom_extra_body", {})
+        if isinstance(custom_extra_body, dict):
+            extra_body.update(custom_extra_body)
+
+        return resp_payloads, extra_body
+
+    async def _query_responses(self, payloads: dict, tools: ToolSet | None) -> LLMResponse:
+        """通过 Responses API 查询（非流式）。"""
+        resp_payloads, extra_body = self._build_responses_payload(payloads, tools)
+
+        response = await self.client.responses.create(
+            **resp_payloads, stream=False,
+            extra_body=extra_body or None,
+        )
+
+        return self._parse_response_api(response, tools)
+
+    async def _query_responses_stream(
+        self, payloads: dict, tools: ToolSet | None,
+    ) -> AsyncGenerator[LLMResponse, None]:
+        """通过 Responses API 流式查询。"""
+        resp_payloads, extra_body = self._build_responses_payload(payloads, tools)
+
+        async with self.client.responses.stream(
+            **resp_payloads,
+            extra_body=extra_body or None,
+        ) as stream:
+            accumulated_text = ""
+            reasoning_text = ""
+            async for event in stream:
+                if event.type == "response.output_text.delta":
+                    accumulated_text += event.delta
+                    chunk_resp = LLMResponse("assistant")
+                    chunk_resp.result_chain = MessageChain().message(accumulated_text)
+                    chunk_resp.is_chunk = True
+                    yield chunk_resp
+                elif event.type == "response.reasoning_summary_text.delta":
+                    reasoning_text += event.delta
+
+            final_response = await stream.get_final_response()
+            final_resp = self._parse_response_api(final_response, tools)
+            if reasoning_text and not final_resp.reasoning_content:
+                final_resp.reasoning_content = reasoning_text
+            yield final_resp
+
+    def _parse_response_api(self, response, tools: ToolSet | None) -> LLMResponse:
+        """解析 Responses API 的 Response 对象为 LLMResponse。"""
+        from openai.types.responses import (
+            ResponseOutputMessage,
+            ResponseReasoningItem,
+            ResponseFunctionToolCall,
+        )
+
+        llm_resp = LLMResponse("assistant")
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+
+        for item in response.output:
+            if isinstance(item, ResponseOutputMessage):
+                for content_block in item.content:
+                    if hasattr(content_block, "text"):
+                        text_parts.append(content_block.text)
+
+            elif isinstance(item, ResponseReasoningItem):
+                for summary_block in (item.summary or []):
+                    if hasattr(summary_block, "text"):
+                        reasoning_parts.append(summary_block.text)
+
+            elif isinstance(item, ResponseFunctionToolCall):
+                llm_resp.tools_call_name.append(item.name)
+                llm_resp.tools_call_ids.append(item.call_id)
+                try:
+                    args = json.loads(item.arguments) if isinstance(item.arguments, str) else item.arguments
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                llm_resp.tools_call_args.append(args)
+
+        if text_parts:
+            llm_resp.result_chain = MessageChain().message("\n".join(text_parts))
+        if reasoning_parts:
+            llm_resp.reasoning_content = "\n".join(reasoning_parts)
+        if llm_resp.tools_call_name:
+            llm_resp.role = "tool"
+
+        # Usage
+        if response.usage:
+            u = response.usage
+            input_details = getattr(u, "input_tokens_details", None)
+            cached = getattr(input_details, "cached_tokens", 0) if input_details else 0
+            input_tokens = getattr(u, "input_tokens", 0) or 0
+            output_tokens = getattr(u, "output_tokens", 0) or 0
+            llm_resp.usage = TokenUsage(
+                input_other=input_tokens - (cached or 0),
+                input_cached=cached or 0,
+                output=output_tokens,
+            )
+
+        llm_resp.raw_completion = response
+        llm_resp.id = response.id
+        llm_resp.is_chunk = False
+        return llm_resp
 
     @staticmethod
     def _normalize_content(raw_content: Any, strip: bool = True) -> str:

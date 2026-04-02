@@ -1133,6 +1133,7 @@ CONFIG_METADATA_2 = {
                         "timeout": 120,
                         "proxy": "",
                         "custom_headers": {},
+                        "use_responses_api": False,
                     },
                     "Google Gemini": {
                         "id": "google_gemini",
