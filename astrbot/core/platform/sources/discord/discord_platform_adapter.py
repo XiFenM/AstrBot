@@ -77,6 +77,12 @@ class DiscordPlatformAdapter(Platform):
         try:
             channel_id = int(channel_id_str)
             channel = self.client.get_channel(channel_id)
+            if channel is None:
+                # 缓存未命中，尝试 API 调用获取
+                try:
+                    channel = await self.client.fetch_channel(channel_id)
+                except Exception:
+                    pass
         except (ValueError, TypeError):
             logger.warning(f"[Discord] Invalid channel ID format: {channel_id_str}")
 

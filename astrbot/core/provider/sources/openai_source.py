@@ -668,7 +668,26 @@ class ProviderOpenAIOfficial(Provider):
                 continue
 
             if role in ("user", "assistant"):
-                item: dict = {"type": "message", "role": role, "content": content}
+                # Responses API 的 content 格式与 Chat Completions 不同：
+                # text → input_text (user) / output_text (assistant)
+                # image_url → input_image
+                resp_content = content
+                if isinstance(content, list):
+                    resp_content = []
+                    for part in content:
+                        if not isinstance(part, dict):
+                            resp_content.append(part)
+                            continue
+                        t = part.get("type", "")
+                        if t == "text":
+                            new_type = "input_text" if role == "user" else "output_text"
+                            resp_content.append({"type": new_type, "text": part.get("text", "")})
+                        elif t == "image_url":
+                            url = (part.get("image_url") or {}).get("url", "")
+                            resp_content.append({"type": "input_image", "image_url": url})
+                        else:
+                            resp_content.append(part)
+                item: dict = {"type": "message", "role": role, "content": resp_content}
                 input_items.append(item)
                 # assistant 消息中的 tool_calls → function_call items
                 if role == "assistant" and msg.get("tool_calls"):
@@ -742,7 +761,14 @@ class ProviderOpenAIOfficial(Provider):
         if "max_tokens" in payloads and "max_output_tokens" not in resp_payloads:
             resp_payloads["max_output_tokens"] = payloads["max_tokens"]
 
+        # 透传非标准参数到 extra_body（如 thinking, response_format）
+        _handled_keys = {"messages", "model", "temperature", "top_p",
+                         "max_output_tokens", "max_tokens", "tool_choice"}
+        resp_extra_from_kwargs = {k: v for k, v in payloads.items()
+                                  if k not in _handled_keys and k not in resp_payloads}
+
         extra_body: dict = {}
+        extra_body.update(resp_extra_from_kwargs)
         custom_extra_body = self.provider_config.get("custom_extra_body", {})
         if isinstance(custom_extra_body, dict):
             extra_body.update(custom_extra_body)
@@ -1077,6 +1103,12 @@ class ProviderOpenAIOfficial(Provider):
         model = model or self.get_model()
 
         payloads = {"messages": context_query, "model": model}
+        # 只透传可 JSON 序列化的 API 参数（如 response_format, thinking），
+        # 过滤掉框架内部参数（如 abort_signal 等 asyncio.Event 对象）
+        _JSON_SAFE = (str, int, float, bool, list, dict, type(None))
+        for k, v in kwargs.items():
+            if isinstance(v, _JSON_SAFE):
+                payloads[k] = v
 
         self._finally_convert_payload(payloads)
 
