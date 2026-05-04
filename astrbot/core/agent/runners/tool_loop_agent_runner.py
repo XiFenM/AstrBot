@@ -975,11 +975,19 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         logger.info(f"Agent 使用工具: {llm_response.tools_call_name}")
 
         def _append_tool_call_result(tool_call_id: str, content: str) -> None:
+            merged_content = self._merge_follow_up_notice(content)
+            # OpenAI 协议要求每个 tool_call_id 仅对应一条 tool message。
+            # 当 handler 是 async generator 多次 yield 时，前几次为 progress、最后一次为 result，
+            # 这里覆盖而非追加，避免同 id 多条 tool 触发 DeepSeek 等严格校验下的 400。
+            for existing in tool_call_result_blocks:
+                if existing.tool_call_id == tool_call_id:
+                    existing.content = merged_content
+                    return
             tool_call_result_blocks.append(
                 ToolCallMessageSegment(
                     role="tool",
                     tool_call_id=tool_call_id,
-                    content=self._merge_follow_up_notice(content),
+                    content=merged_content,
                 ),
             )
 
