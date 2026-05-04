@@ -988,6 +988,12 @@ class ProviderOpenAIOfficial(Provider):
         model = model or self.get_model()
 
         payloads = {"messages": context_query, "model": model}
+        # 只透传可 JSON 序列化的 API 参数（如 response_format, thinking），
+        # 过滤掉框架内部参数（如 abort_signal 等 asyncio.Event 对象）
+        _JSON_SAFE = (str, int, float, bool, list, dict, type(None))
+        for k, v in kwargs.items():
+            if isinstance(v, _JSON_SAFE):
+                payloads[k] = v
 
         self._finally_convert_payload(payloads)
 
