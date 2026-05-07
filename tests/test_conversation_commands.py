@@ -179,3 +179,81 @@ async def test_clear_third_party_agent_runner_state_removes_local_state_when_dee
         "umo-3",
         conversation_module.DEERFLOW_THREAD_ID_KEY,
     ) in calls
+
+
+# ════════════════════════════════════════
+# /stats context-window display
+# ════════════════════════════════════════
+
+
+def _make_commands(provider_max_ctx: int = 0, model: str = "claude-sonnet-4-5",
+                   fallback: int = 128000):
+    """Construct ConversationCommands with a stub context for unit-testing
+    pure helper methods (no DB / event involvement)."""
+    provider = SimpleNamespace(
+        provider_config={"max_context_tokens": provider_max_ctx},
+        get_model=lambda: model,
+        meta=lambda: SimpleNamespace(id="prov1"),
+    )
+    context = SimpleNamespace(
+        get_using_provider=lambda umo=None: provider,
+        get_config=lambda umo=None: {
+            "provider_settings": {"fallback_max_context_tokens": fallback}
+        },
+    )
+    return conversation_module.ConversationCommands(context)
+
+
+def test_resolve_max_context_tokens_uses_explicit_config():
+    cmds = _make_commands(provider_max_ctx=200000)
+    provider = cmds.context.get_using_provider()
+    assert cmds._resolve_max_context_tokens(provider, "umo") == 200000
+
+
+def test_resolve_max_context_tokens_falls_back_to_metadata(monkeypatch):
+    cmds = _make_commands(provider_max_ctx=0, model="meta-test-model")
+    provider = cmds.context.get_using_provider()
+    monkeypatch.setattr(
+        "astrbot.core.utils.llm_metadata.LLM_METADATAS",
+        {"meta-test-model": {"limit": {"context": 64000}}},
+    )
+    assert cmds._resolve_max_context_tokens(provider, "umo") == 64000
+
+
+def test_resolve_max_context_tokens_uses_fallback_setting(monkeypatch):
+    cmds = _make_commands(provider_max_ctx=0, model="unknown-model", fallback=99999)
+    provider = cmds.context.get_using_provider()
+    monkeypatch.setattr("astrbot.core.utils.llm_metadata.LLM_METADATAS", {})
+    assert cmds._resolve_max_context_tokens(provider, "umo") == 99999
+
+
+def test_format_context_line_unknown_max():
+    cmds = _make_commands()
+    line = cmds._format_context_line(0, 0)
+    assert "unknown" in line
+
+
+def test_format_context_line_no_current_tokens_yet():
+    cmds = _make_commands()
+    line = cmds._format_context_line(0, 200_000)
+    # Compaction threshold = 82% of 200k = 164,000
+    assert "164,000" in line
+    assert "200,000" in line
+
+
+def test_format_context_line_under_threshold():
+    cmds = _make_commands()
+    line = cmds._format_context_line(50_000, 200_000)
+    # remaining until compact = 164000 - 50000 = 114000
+    assert "50,000" in line
+    assert "114,000" in line
+    assert "until compact" in line
+
+
+def test_format_context_line_over_threshold():
+    cmds = _make_commands()
+    # 180k > 164k → over threshold by 16k
+    line = cmds._format_context_line(180_000, 200_000)
+    assert "180,000" in line
+    assert "16,000" in line
+    assert "over compact threshold" in line

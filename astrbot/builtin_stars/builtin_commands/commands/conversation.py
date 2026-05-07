@@ -287,12 +287,23 @@ class ConversationCommands:
             )
             stats = result.one()
 
+        provider_using = self.context.get_using_provider(umo=umo)
+        provider_line = ""
+        ctx_line = ""
+        if provider_using:
+            model_name = provider_using.get_model() or "(unknown)"
+            provider_id = provider_using.meta().id
+            provider_line = f"Model:          {provider_id} / {model_name}\n"
+
+            max_ctx = self._resolve_max_context_tokens(provider_using, umo)
+            current_tokens = await self._resolve_current_tokens(umo, cid)
+            ctx_line = self._format_context_line(current_tokens, max_ctx)
+
         if stats.record_count == 0:
-            message.set_result(
-                MessageEventResult().message(
-                    "📊 No stats available for this conversation yet."
-                ),
-            )
+            header = f"📊 Conversation status (ID: {cid[:8]}...)\n"
+            ret = header + provider_line + ctx_line
+            ret += "📊 No token usage records for this conversation yet.\n"
+            message.set_result(MessageEventResult().message(ret))
             return
 
         total_input_other = stats.total_input_other
@@ -301,7 +312,9 @@ class ConversationCommands:
         total_tokens = total_input_other + total_input_cached + total_output
 
         ret = (
-            f"📊 Conversation Token usage (ID: {cid[:8]}...)\n"
+            f"📊 Conversation status (ID: {cid[:8]}...)\n"
+            f"{provider_line}"
+            f"{ctx_line}"
             f"Total:          {total_tokens:,}\n"
             f"Input (cached): {total_input_cached:,}\n"
             f"Input (other):  {total_input_other:,}\n"
@@ -309,3 +322,59 @@ class ConversationCommands:
         )
 
         message.set_result(MessageEventResult().message(ret))
+
+    def _resolve_max_context_tokens(self, provider, umo: str) -> int:
+        """Resolve effective max_context_tokens for display.
+
+        Mirrors the boot-time fill-in logic in astr_main_agent: explicit config
+        wins; otherwise look up LLM_METADATAS by model name; otherwise fall back
+        to provider_settings.fallback_max_context_tokens (default 128000)."""
+        from astrbot.core.utils.llm_metadata import LLM_METADATAS
+
+        configured = provider.provider_config.get("max_context_tokens", 0)
+        if configured and configured > 0:
+            return int(configured)
+
+        model = provider.get_model()
+        if model and (info := LLM_METADATAS.get(model)):
+            limit = info.get("limit", {}).get("context")
+            if limit:
+                return int(limit)
+
+        cfg = self.context.get_config(umo=umo).get("provider_settings", {})
+        return int(cfg.get("fallback_max_context_tokens", 128000))
+
+    async def _resolve_current_tokens(self, umo: str, cid: str) -> int:
+        """Fetch the most recent LLM call's total tokens for this conversation.
+
+        ConversationV2.token_usage is updated after each turn with the latest
+        prompt+completion total — this is the closest stand-in for "how full is
+        the context right now"."""
+        conv = await self.context.conversation_manager.get_conversation(umo, cid)
+        if not conv:
+            return 0
+        return int(getattr(conv, "token_usage", 0) or 0)
+
+    def _format_context_line(self, current: int, max_ctx: int) -> str:
+        """Format the context-window / compaction-threshold line."""
+        if max_ctx <= 0:
+            return "Context:        (max_context_tokens unknown)\n"
+
+        # Built-in compressors default to 82% — note that custom compressors may
+        # override this; the line is informational, not authoritative.
+        threshold_ratio = 0.82
+        threshold = int(max_ctx * threshold_ratio)
+        if current <= 0:
+            return (
+                f"Context:        ?/{max_ctx:,} (compact at ~{threshold:,})\n"
+            )
+
+        pct = (current / max_ctx) * 100
+        remaining = threshold - current
+        if remaining > 0:
+            tail = f"{remaining:,} until compact (@{threshold_ratio:.0%})"
+        else:
+            tail = f"over compact threshold by {-remaining:,}"
+        return (
+            f"Context:        {current:,}/{max_ctx:,} ({pct:.1f}%) — {tail}\n"
+        )
